@@ -2,7 +2,7 @@
 
 namespace App\Http\DTOs\Auth;
 
-class RegisterDto
+class AddUserDto
 {
     public string $name;
     public string $email;
