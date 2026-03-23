@@ -32,9 +32,9 @@ class EmailVerificationController extends Controller
 {
     $user = User::findOrFail($id);
 
-    // الرابط انتهت صلاحيته
+    // الرابط غير صالح أو انتهت صلاحيته
     if (! $request->hasValidSignature()) {
-        return response()->json(['message' => 'Link expired'], 400);
+        return response()->json(['message' => 'الرابط غير صالح أو انتهت صلاحيته. أعد إرسال رابط التحقق.'], 403);
     }
 
     // تأكد من الهاش

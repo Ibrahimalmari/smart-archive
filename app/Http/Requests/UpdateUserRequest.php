@@ -22,10 +22,13 @@ class UpdateUserRequest extends FormRequest
    public function rules(): array
     {
         return [
-            'name'     => 'nullable|string',
-            'email'    => 'nullable|email',
-            'password' => 'nullable|string|min:6',
-            'role'     => 'nullable|string', // فقط للـ Admin/Manager
+            'name'            => 'nullable|string',
+            'email'           => 'nullable|email',
+            'password'        => 'nullable|string|min:6',
+            'role'            => 'nullable|string',
+            'organization_id' => 'nullable|exists:organizations,id',
+            'department_id'   => 'nullable|exists:departments,id',
         ];
     }
+
 }

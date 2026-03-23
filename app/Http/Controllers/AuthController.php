@@ -34,8 +34,11 @@ class AuthController extends Controller
             $request->name,
             $request->email,
             $request->password,
-            $request->role ?? 'Employee'
+            $request->role ?? 'Employee',
+            $request->organization_id,
+            $request->department_id,
         );
+
 
 
         return response()->json(

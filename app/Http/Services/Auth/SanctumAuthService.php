@@ -20,29 +20,27 @@ class SanctumAuthService implements AuthServiceInterface
         $this->users = $users;
     }
 
-   public function AddUser(AddUserDto $dto)
+  public function AddUser(AddUserDto $dto)
 {
     $data = [
-        'name'     => $dto->name,
-        'email'    => $dto->email,
-        'password' => Hash::make($dto->password),
-        'role'     => $dto->role
+        'name'            => $dto->name,
+        'email'           => $dto->email,
+        'password'        => Hash::make($dto->password),
+        'role'            => $dto->role,
+        'organization_id' => $dto->organization_id,
+        'department_id'   => $dto->department_id,
     ];
 
-    // 1) إنشاء المستخدم
     $user = $this->users->create($data);
 
-    // 2) إرسال إيميل التحقق
     $user->sendEmailVerificationNotification();
-
- 
 
     return [
         'message' => 'User created. Verification email sent.',
         'user'    => $user,
-       
     ];
 }
+
 
 
  public function login(LoginDto $dto): array|null
@@ -144,7 +142,7 @@ public function updateOwnProfile(int $userId, UpdateUserDto $dto)
         $data['password'] = Hash::make($dto->password);
     }
 
-    // ❌ المستخدم لا يمكنه تعديل الدور
+    //  المستخدم لا يمكنه تعديل الدور
     unset($data['role']);
 
     return $this->users->update($userId, $data);
@@ -162,15 +160,9 @@ public function updateUserAsAdmin(int $userId, UpdateUserDto $dto)
         $data['name'] = $dto->name;
     }
 
-    // === Email update + re-verification ===
     if ($dto->email !== null && $dto->email !== $user->email) {
-
         $data['email'] = $dto->email;
-
-        // Reset verification
         $data['email_verified_at'] = null;
-
-        // Update immediately and send verification
         $user->forceFill(['email' => $dto->email, 'email_verified_at' => null]);
         $user->save();
         $user->sendEmailVerificationNotification();
@@ -180,13 +172,22 @@ public function updateUserAsAdmin(int $userId, UpdateUserDto $dto)
         $data['password'] = Hash::make($dto->password);
     }
 
-    // Admin/Manager can update role
     if ($dto->role !== null) {
         $data['role'] = $dto->role;
     }
 
+    // هنا تضيف الكود
+    if ($dto->organization_id !== null) {
+        $data['organization_id'] = $dto->organization_id;
+    }
+
+    if ($dto->department_id !== null) {
+        $data['department_id'] = $dto->department_id;
+    }
+
     return $this->users->update($userId, $data);
 }
+
 
 
     public function deleteUser(int $id)

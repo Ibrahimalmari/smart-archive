@@ -35,7 +35,7 @@ class EmailVerificationNotification extends Notification
     public function toMail($notifiable)
     {
         // مدة الصلاحية بالدقائق
-        $expire = 2; // دقيقتان فقط
+        $expire = 60; // الآن 60 دقيقة (للتجربة والاختبار)
 
         // توليد رابط مُوقع signed URL
         $verificationUrl = URL::temporarySignedRoute(
@@ -48,10 +48,13 @@ class EmailVerificationNotification extends Notification
         );
 
         return (new \Illuminate\Notifications\Messages\MailMessage)
-            ->subject('Verify Your Email Address')
-            ->line('Click the button below to verify your email address.')
-            ->action('Verify Email', $verificationUrl)
-            ->line('This verification link expires in ' . $expire . ' minutes.');
+            ->subject('التحقق من البريد الإلكتروني - Smart Archive')
+            ->from(config('mail.from.address', 'no-reply@smartarchive.local'), 'Smart Archive')
+            ->view('emails.verify-email', [
+                'user' => $notifiable,
+                'verificationUrl' => $verificationUrl,
+                'expire' => $expire,
+            ]);
     }
 
     /**

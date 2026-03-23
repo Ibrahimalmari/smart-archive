@@ -17,8 +17,11 @@ return new class extends Migration
             $table->string('email')->unique();
             $table->timestamp('email_verified_at')->nullable();
             $table->string('password');
-            $table->enum('role', ['Admin', 'Manager', 'Employee', 'Auditor'])->default('Employee');
+            $table->enum('role', ['SuperAdmin','Admin', 'Manager', 'Employee', 'Auditor'])
+      ->default('Employee');
             $table->enum('status', ['active', 'inactive'])->default('active');
+            $table->foreignId('organization_id')->nullable()->constrained('organizations')->nullOnDelete();
+            $table->foreignId('department_id')->nullable()->constrained('departments')->nullOnDelete();
             $table->rememberToken();
             $table->timestamps();
         });
