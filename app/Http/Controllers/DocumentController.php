@@ -9,6 +9,8 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Storage;
 use App\Models\Document;
+use Smalot\PdfParser\Parser;
+use thiagoalessio\TesseractOCR\TesseractOCR;
 
 class DocumentController extends Controller
 {
@@ -318,5 +320,296 @@ class DocumentController extends Controller
         }
 
         return response()->json(['message' => 'تم حذف الوثيقة بنجاح']);
+    }
+
+    /**
+     * تحميل وثيقة
+     * - نفس قواعد الوصول مثل show()
+     */
+    public function download($id)
+    {
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
+        }
+
+        // التحقق من الوصول
+        if ($user->role === 'SuperAdmin') {
+            // يمكنه تحميل أي وثيقة
+        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك تحميل هذه الوثيقة'], 403);
+        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك تحميل هذه الوثيقة'], 403);
+        }
+
+        // التحقق من وجود الملف
+        if (!$doc->path || !Storage::disk('public')->exists($doc->path)) {
+            return response()->json(['message' => 'الملف غير موجود على الخادم'], 404);
+        }
+
+        // إرجاع الملف للتحميل
+        /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
+        $disk = Storage::disk('public');
+        return response()->download($disk->path($doc->path), $doc->original_name);
+    }
+
+    /**
+     * عرض وثيقة (إرجاع رابط للعرض)
+     * - نفس قواعد الوصول مثل show()
+     */
+    public function view($id)
+    {
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
+        }
+
+        // التحقق من الوصول
+        if ($user->role === 'SuperAdmin') {
+            // يمكنه عرض أي وثيقة
+        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك عرض هذه الوثيقة'], 403);
+        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك عرض هذه الوثيقة'], 403);
+        }
+
+        // التحقق من وجود الملف
+        /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
+        $disk = Storage::disk('public');
+        if (!$doc->path || !$disk->exists($doc->path)) {
+            return response()->json(['message' => 'الملف غير موجود على الخادم'], 404);
+        }
+
+        // إرجاع رابط للعرض
+        $url = $disk->url($doc->path);
+
+        return response()->json([
+            'document' => $doc,
+            'view_url' => $url
+        ]);
+    }
+
+    /**
+     * البحث في الوثائق
+     * - البحث في العنوان والوصف
+     * - فلترة حسب الدور
+     */
+    public function search(Request $request)
+    {
+        $user = Auth::user();
+        $query = $request->get('q', '');
+        $limit = $request->get('limit', 20);
+
+        if (empty($query)) {
+            return response()->json(['message' => 'يجب تحديد كلمة البحث'], 400);
+        }
+
+        $documentsQuery = Document::with('user', 'organization', 'department')
+            ->where(function ($q) use ($query) {
+                $q->where('title', 'like', "%{$query}%")
+                  ->orWhere('description', 'like', "%{$query}%")
+                  ->orWhere('original_name', 'like', "%{$query}%");
+            });
+
+        // تطبيق الفلاتر حسب الدور
+        if ($user->role === 'SuperAdmin') {
+            // لا قيود
+        } elseif ($user->role === 'Admin') {
+            $documentsQuery->where('organization_id', $user->organization_id);
+        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor'])) {
+            $documentsQuery->where('department_id', $user->department_id);
+        }
+
+        $documents = $documentsQuery->limit($limit)->get();
+
+        return response()->json([
+            'query' => $query,
+            'results' => $documents,
+            'count' => $documents->count()
+        ]);
+    }
+
+    /**
+     * استخراج النص من الوثيقة باستخدام OCR
+     * - يدعم PDF و الصور
+     */
+    public function extractOcr($id)
+    {
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
+        }
+
+        // التحقق من الوصول
+        if ($user->role === 'SuperAdmin') {
+            // يمكنه استخراج OCR من أي وثيقة
+        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
+        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
+        }
+
+        // التحقق من وجود الملف
+        /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
+        $disk = Storage::disk('public');
+        if (!$doc->path || !$disk->exists($doc->path)) {
+            return response()->json(['message' => 'الملف غير موجود على الخادم'], 404);
+        }
+
+        try {
+            // جرب Tesseract من PATH ثم من مسار ثابت
+            $tesseractExecutable = env('TESSERACT_PATH', 'C:\\Program Files\\Tesseract-OCR\\tesseract.exe');
+            $tesseractVersion = null;
+
+            if (file_exists($tesseractExecutable)) {
+                $tesseractVersion = shell_exec('"' . $tesseractExecutable . '" --version 2>&1');
+            } else {
+                $tesseractVersion = shell_exec('tesseract --version 2>&1');
+                if ($tesseractVersion) {
+                    $tesseractExecutable = 'tesseract';
+                }
+            }
+
+            if (!$tesseractVersion || stripos($tesseractVersion, 'tesseract') === false) {
+                return response()->json([
+                    'message' => 'Tesseract OCR غير مثبت أو غير متاح في بيئة PHP',
+                    'error' => 'يجب تثبيت Tesseract OCR و/أو تحديث PATH',
+                    'install_instructions' => [
+                        '1. اذهب إلى: https://github.com/UB-Mannheim/tesseract/wiki',
+                        '2. ثبت Tesseract ثم أضف C:\\Program Files\\Tesseract-OCR إلى PATH',
+                        '3. تأكد أن الأمر tesseract يعمل في cmd/powershell',
+                        '4. أعد تشغيل الخادم وبيئة التطوير',
+                        '5. يمكن استعمال المتغير TESSERACT_PATH في .env لتحديد المسار مباشرة'
+                    ],
+                    'download_link' => 'https://github.com/UB-Mannheim/tesseract/wiki',
+                    'technical_error' => trim($tesseractVersion ?? 'غير معروف')
+                ], 503);
+            }
+
+            $filePath = $disk->path($doc->path);
+            $tempImage = null;
+
+            $fileExtension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+
+            if ($fileExtension === 'pdf') {
+
+                try {
+                    $parser = new Parser();
+                    $pdf = $parser->parseFile($filePath);
+
+                    $extractedText = trim($pdf->getText());
+
+                    if (empty($extractedText)) {
+                        return response()->json([
+                            'message' => 'هذا PDF عبارة عن صورة (Scan)',
+                            'note' => 'يجب استخدام OCR له (سأعلمك لاحقًا)'
+                        ], 422);
+                    }
+
+                } catch (\Exception $e) {
+                    return response()->json([
+                        'message' => 'فشل في قراءة PDF',
+                        'error' => $e->getMessage()
+                    ], 500);
+                }
+
+            } else {
+
+                // الصور فقط → OCR
+                $ocr = new TesseractOCR($filePath);
+                $ocr->executable($tesseractExecutable);
+                $ocr->lang('ara+eng');
+
+                $extractedText = $ocr->run();
+            }
+
+            $fileExtension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+
+            if ($fileExtension === 'pdf') {
+
+                try {
+                    $parser = new Parser();
+                    $pdf = $parser->parseFile($filePath);
+
+                    $extractedText = trim($pdf->getText());
+
+                    if (empty($extractedText)) {
+                        return response()->json([
+                            'message' => 'هذا PDF عبارة عن صورة (Scan)',
+                            'note' => 'حاليًا النظام يدعم فقط PDF النصي'
+                        ], 422);
+                    }
+
+                } catch (\Exception $e) {
+                    return response()->json([
+                        'message' => 'فشل في قراءة PDF',
+                        'error' => $e->getMessage()
+                    ], 500);
+                }
+
+            } else {
+
+                // الصور فقط → OCR
+                $ocr = new TesseractOCR($filePath);
+                $ocr->executable($tesseractExecutable);
+                $ocr->lang('ara+eng');
+
+                $extractedText = $ocr->run();
+            }
+
+            // حذف الملف المؤقت إذا أنشأناه
+            if ($tempImage && file_exists($tempImage)) {
+                @unlink($tempImage);
+            }
+
+            // حفظ النص المستخرج في قاعدة البيانات
+            $doc->extracted_text = $extractedText;
+            $doc->save();
+
+            return response()->json([
+                'document_id' => $doc->id,
+                'extracted_text' => $extractedText,
+                'message' => 'تم استخراج النص بنجاح'
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'message' => 'فشل في استخراج النص',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * عرض النص المستخرج من الوثيقة
+     */
+    public function getOcrText($id)
+    {
+        $user = Auth::user();
+        $doc = Document::with('user', 'organization', 'department')->find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
+        }
+
+        // التحقق من الوصول
+        if ($user->role === 'SuperAdmin') {
+            // يمكنه عرض أي وثيقة
+        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
+        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
+        }
+
+        return response()->json([
+            'document' => $doc,
+            'extracted_text' => $doc->extracted_text ?? 'لم يتم استخراج نص بعد'
+        ]);
     }
 }

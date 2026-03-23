@@ -112,6 +112,10 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/documents/mine', [DocumentController::class, 'myDocuments'])
         ->middleware('auth:sanctum');
 
+    // Search documents (must be before /documents/{id})
+    Route::get('/documents/search', [DocumentController::class, 'search'])
+        ->middleware('auth:sanctum');
+
     // View single document
     Route::get('/documents/{id}', [DocumentController::class, 'show'])
         ->middleware('auth:sanctum');
@@ -124,6 +128,22 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Delete document
     Route::delete('/documents/{id}', [DocumentController::class, 'delete'])
+        ->middleware('auth:sanctum');
+
+    // Download document
+    Route::get('/documents/{id}/download', [DocumentController::class, 'download'])
+        ->middleware('auth:sanctum');
+
+    // View document (temporary URL)
+    Route::get('/documents/{id}/view', [DocumentController::class, 'view'])
+        ->middleware('auth:sanctum');
+
+    // OCR: Extract text from document
+    Route::post('/documents/{id}/ocr', [DocumentController::class, 'extractOcr'])
+        ->middleware('auth:sanctum');
+
+    // OCR: Get extracted text
+    Route::get('/documents/{id}/ocr', [DocumentController::class, 'getOcrText'])
         ->middleware('auth:sanctum');
 
 });

@@ -21,6 +21,7 @@ class Document extends Model
         'ai_document_id',
         'organization_id',
         'department_id',
+        'extracted_text',
     ];
 
 
