@@ -3,32 +3,26 @@
 namespace App\Http\Requests;
 
 use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
 
 class UpdateUserRequest extends FormRequest
 {
-    /**
-     * Determine if the user is authorized to make this request.
-     */
     public function authorize(): bool
     {
-         return true;
+        return true;
     }
 
-    /**
-     * Get the validation rules that apply to the request.
-     *
-     * @return array<string, \Illuminate\Contracts\Validation\ValidationRule|array<mixed>|string>
-     */
-   public function rules(): array
+    public function rules(): array
     {
+        $userId = $this->route('id');
+
         return [
-            'name'            => 'nullable|string',
-            'email'           => 'nullable|email',
-            'password'        => 'nullable|string|min:6',
-            'role'            => 'nullable|string',
+            'name' => 'nullable|string',
+            'email' => ['nullable', 'email', Rule::unique('users', 'email')->ignore($userId)],
+            'password' => 'nullable|string|min:6',
+            'role' => ['nullable', Rule::in(['SuperAdmin', 'Admin', 'Manager', 'Employee', 'Auditor'])],
             'organization_id' => 'nullable|exists:organizations,id',
-            'department_id'   => 'nullable|exists:departments,id',
+            'department_id' => 'nullable|exists:departments,id',
         ];
     }
-
 }

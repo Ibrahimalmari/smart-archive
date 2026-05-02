@@ -52,6 +52,12 @@ class AppServiceProvider extends ServiceProvider
         \App\Http\Repositories\DocumentRepositoryInterface::class,
         \App\Http\Repositories\DocumentRepository::class
     );
+
+     $this->app->bind(
+        \App\Http\Services\Document\DocumentContentStoreInterface::class,
+        \App\Http\Services\Document\HybridDocumentContentStore::class
+    );
+
      $this->app->bind(
         OrganizationRepositoryInterface::class,
         OrganizationRepository::class

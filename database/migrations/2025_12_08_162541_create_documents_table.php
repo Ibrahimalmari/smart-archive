@@ -18,10 +18,14 @@ return new class extends Migration
             $table->unsignedBigInteger('size')->nullable();
             $table->enum('status', ['pending', 'under_review', 'approved', 'rejected', 'archived'])
                   ->default('pending');
+            $table->string('document_type', 100)->nullable();
+            $table->decimal('classification_confidence', 5, 2)->nullable();
+            $table->string('classification_source', 50)->nullable();
             $table->foreignId('organization_id')->constrained()->cascadeOnDelete();
             $table->foreignId('department_id')->constrained()->cascadeOnDelete();
             $table->foreignId('uploaded_by')->constrained('users')->cascadeOnDelete();
             $table->string('ai_document_id')->nullable();
+            $table->index('document_type');
             $table->timestamps();
         });
     }

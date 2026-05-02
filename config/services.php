@@ -35,4 +35,20 @@ return [
         ],
     ],
 
+    'ollama' => [
+        'base_url' => env('OLLAMA_BASE_URL', 'http://localhost:11434'),
+        'embedding_model' => env('OLLAMA_EMBEDDING_MODEL', 'nomic-embed-text'),
+        'embedding_dimensions' => env('OLLAMA_EMBEDDING_DIMENSIONS', 0),
+        'timeout' => env('OLLAMA_TIMEOUT', 30),
+        'search_min_score' => env('OLLAMA_SEARCH_MIN_SCORE', 0.45),
+    ],
+
+    'document_content' => [
+        'driver' => env('DOCUMENT_CONTENT_DRIVER', 'database'),
+        'strict' => env('DOCUMENT_CONTENT_STRICT', false),
+        'mongodb_uri' => env('DOCUMENT_CONTENT_MONGODB_URI', 'mongodb://127.0.0.1:27017'),
+        'mongodb_database' => env('DOCUMENT_CONTENT_MONGODB_DATABASE', 'smart_archive'),
+        'mongodb_collection' => env('DOCUMENT_CONTENT_MONGODB_COLLECTION', 'document_contents'),
+    ],
+
 ];

@@ -10,7 +10,7 @@ class DocumentRepository implements DocumentRepositoryInterface
 {
     public function create(DocumentDto $dto)
     {
-        return Document::create([
+        $document = Document::create([
             'title'         => $dto->title,
             'description'   => $dto->description,
             'original_name' => $dto->originalName,
@@ -20,7 +20,16 @@ class DocumentRepository implements DocumentRepositoryInterface
             'uploaded_by'   => $dto->userId,            
             'organization_id' => $dto->organizationId,
             'department_id'   => $dto->departmentId,
+            'document_type' => $dto->documentType,
+            'classification_confidence' => $dto->classificationConfidence,
+            'classification_source' => $dto->classificationSource,
         ]);
+
+        $document->workflow()->create([
+            'status' => Document::STATUS_PENDING,
+        ]);
+
+        return $document->fresh();
     }
 
     public function getAllForUser($user)

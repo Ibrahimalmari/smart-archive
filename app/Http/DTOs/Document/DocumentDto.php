@@ -13,6 +13,9 @@ class DocumentDto
     public int $userId;
     public ?int $organizationId;
     public ?int $departmentId;
+    public ?string $documentType;
+    public ?float $classificationConfidence;
+    public ?string $classificationSource;
 
     public function __construct(
         string $title,
@@ -23,7 +26,10 @@ class DocumentDto
         string $path,
         int $userId,
         ?int $organizationId = null,
-        ?int $departmentId = null
+        ?int $departmentId = null,
+        ?string $documentType = null,
+        ?float $classificationConfidence = null,
+        ?string $classificationSource = null
     ) {
         $this->title = $title;
         $this->description = $description;
@@ -34,5 +40,8 @@ class DocumentDto
         $this->userId = $userId;
         $this->organizationId = $organizationId;
         $this->departmentId = $departmentId;
+        $this->documentType = $documentType;
+        $this->classificationConfidence = $classificationConfidence;
+        $this->classificationSource = $classificationSource;
     }
 }

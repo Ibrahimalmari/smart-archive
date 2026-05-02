@@ -2,19 +2,20 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use App\Http\Services\Auth\AuthServiceInterface;
-use App\Http\Services\Auth\PasswordServiceInterface;
-use App\Http\DTOs\Auth\ForgotPasswordDto;
-use App\Http\DTOs\Auth\ResetPasswordDto;
 use App\Http\DTOs\Auth\AddUserDto;
+use App\Http\DTOs\Auth\ForgotPasswordDto;
 use App\Http\DTOs\Auth\LoginDto;
+use App\Http\DTOs\Auth\ResetPasswordDto;
+use App\Http\DTOs\Auth\ToggleStatusDto;
+use App\Http\DTOs\Auth\UpdateUserDto;
 use App\Http\Requests\AddUserRequest;
 use App\Http\Requests\LoginRequest;
-use App\Http\Requests\UpdateUserRequest;
-use App\Http\DTOs\Auth\UpdateUserDto;
 use App\Http\Requests\ToggleStatusRequest;
-use App\Http\DTOs\Auth\ToggleStatusDto;
+use App\Http\Requests\UpdateUserRequest;
+use App\Http\Services\Auth\AuthServiceInterface;
+use App\Http\Services\Auth\PasswordServiceInterface;
+use Illuminate\Http\Request;
+
 class AuthController extends Controller
 {
     private AuthServiceInterface $auth;
@@ -22,13 +23,11 @@ class AuthController extends Controller
 
     public function __construct(AuthServiceInterface $auth, PasswordServiceInterface $password)
     {
-        $this->auth     = $auth;
+        $this->auth = $auth;
         $this->password = $password;
     }
-   
 
-    // Register
-      public function AddUser(AddUserRequest $request)
+    public function addUser(AddUserRequest $request)
     {
         $dto = new AddUserDto(
             $request->name,
@@ -39,95 +38,97 @@ class AuthController extends Controller
             $request->department_id,
         );
 
-
-
         return response()->json(
-            $this->auth->AddUser($dto),
+            $this->auth->addUser($dto, $request->user()),
             201
         );
     }
 
-    // Login
-     public function login(LoginRequest $request)
+    public function login(LoginRequest $request)
     {
-         $dto = new LoginDto(
-        $request->email,
-        $request->password
-    );
+        $dto = new LoginDto(
+            $request->email,
+            $request->password
+        );
 
-    $result = $this->auth->login($dto);
+        $result = $this->auth->login($dto);
 
-    // خطأ باسورد / إيميل
-    if ($result === null) {
-        return response()->json(['message' => 'Invalid credentials'], 401);
+        if ($result === null) {
+            return response()->json(['message' => 'Invalid credentials'], 401);
+        }
+
+        if (($result['status'] ?? null) !== 'ok') {
+            return response()->json(['message' => $result['message'] ?? 'Login failed'], 403);
+        }
+
+        return response()->json([
+            'user' => $result['user'],
+            'plain_token' => $result['plain_token'],
+            'expires_at' => $result['expires_at'],
+        ]);
     }
-
-    // الإيميل غير مُتحقق
-    if (isset($result['error']) && $result['error'] === true) {
-        return response()->json(['message' => $result['message']], 403);
-    }
-
-    return response()->json($result);
-    }
-
 
     public function updateMe(UpdateUserRequest $request)
-{
-    $userId = $request->user()->id;
+    {
+        $userId = $request->user()->id;
 
-    $dto = new UpdateUserDto(
-        $request->input('name'),
-        $request->input('email'),
-        $request->input('password'),
-        null // ❌ ممنوع تغيير الدور
-    );
+        $dto = new UpdateUserDto(
+            $request->input('name'),
+            $request->input('email'),
+            $request->input('password'),
+            null
+        );
 
-    $user = $this->auth->updateOwnProfile($userId, $dto);
+        $user = $this->auth->updateOwnProfile($userId, $dto);
 
-    return response()->json(['user' => $user]);
-}
+        return response()->json(['user' => $user]);
+    }
 
+    public function updateUser(UpdateUserRequest $request, $id)
+    {
+        $dto = new UpdateUserDto(
+            $request->input('name'),
+            $request->input('email'),
+            $request->input('password'),
+            $request->input('role'),
+            $request->input('organization_id'),
+            $request->input('department_id'),
+        );
 
-public function updateUser(UpdateUserRequest $request, $id)
-{
-    $dto = new UpdateUserDto(
-        $request->input('name'),
-        $request->input('email'),
-        $request->input('password'),
-        $request->input('role') // ✔️ Admin/Manager يمكنه تعديل الدور
-    );
+        $user = $this->auth->updateUserAsAdmin($id, $dto, $request->user());
 
-    $user = $this->auth->updateUserAsAdmin($id, $dto);
+        return response()->json(['user' => $user]);
+    }
 
-    return response()->json(['user' => $user]);
-}
-
-
-    // Get logged in user
     public function user(Request $request)
     {
         return response()->json($request->user());
     }
 
-    // Logout
     public function logout(Request $request)
     {
-        $request->user()->tokens()->delete();
+        $token = $request->user()->currentAccessToken();
+
+        if ($token) {
+            $token->delete();
+        } else {
+            $request->user()->tokens()->delete();
+        }
 
         return response()->json(['message' => 'Logged out successfully']);
     }
- public function logoutAll(Request $request)
-{
-    $userId = $request->user()->id;
 
-    $this->auth->logoutAll($userId);
+    public function logoutAll(Request $request)
+    {
+        $userId = $request->user()->id;
+        $this->auth->logoutAll($userId);
 
-    return response()->json([
-        'message' => 'Logged out from all devices successfully'
-    ]);
-}
+        return response()->json([
+            'message' => 'Logged out from all devices successfully'
+        ]);
+    }
 
-        public function forgotPassword(Request $request)
+    public function forgotPassword(Request $request)
     {
         $request->validate([
             'email' => 'required|email',
@@ -145,11 +146,9 @@ public function updateUser(UpdateUserRequest $request, $id)
     public function resetPassword(Request $request)
     {
         $request->validate([
-            'email'    => 'required|email',
-            'token'    => 'required',
+            'email' => 'required|email',
+            'token' => 'required',
             'password' => 'required|min:6',
-            // لو تحب add confirmation:
-            // 'password_confirmation' => 'required|same:password',
         ]);
 
         $dto = new ResetPasswordDto(
@@ -166,22 +165,20 @@ public function updateUser(UpdateUserRequest $request, $id)
     }
 
     public function deleteUser(Request $request, $id)
-{
-    $this->auth->deleteUser($id);
-    return response()->json(['message' => 'User deleted successfully']);
-}
+    {
+        $this->auth->deleteUser($id, $request->user());
 
-public function changeStatus(ToggleStatusRequest $request, $id)
-{
-    $dto = new ToggleStatusDto(
-        status: $request->input('status'),
-    );
+        return response()->json(['message' => 'User deleted successfully']);
+    }
 
-    $user = $this->auth->toggleUserStatus($id, $dto);
+    public function changeStatus(ToggleStatusRequest $request, $id)
+    {
+        $dto = new ToggleStatusDto(
+            status: $request->input('status'),
+        );
 
-    return response()->json(['user' => $user]);
-}
+        $user = $this->auth->toggleUserStatus($id, $dto, $request->user());
 
-    
-
+        return response()->json(['user' => $user]);
+    }
 }

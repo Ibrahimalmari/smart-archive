@@ -2,56 +2,64 @@
 
 namespace App\Http\Controllers;
 
-use App\Http\Services\Document\DocumentServiceInterface;
-use App\Http\DTOs\Document\DocumentDto;
 use App\Http\Requests\StoreDocumentRequest;
+use App\Http\Services\Document\DocumentAccessService;
+use App\Http\Services\Document\DocumentClassificationService;
+use App\Http\Services\Document\DocumentContentStoreInterface;
+use App\Http\Services\Document\DocumentEmbeddingService;
+use App\Http\Services\Document\DocumentMutationService;
+use App\Http\Services\Document\DocumentWorkflowService;
+use App\Http\Services\Document\DocumentWorkflowTransitionException;
+use App\Http\Services\Document\OcrTextNormalizer;
+use App\Models\Document;
+use App\Models\DocumentApprovalLog;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Storage;
-use App\Models\Document;
-use Smalot\PdfParser\Parser;
 use thiagoalessio\TesseractOCR\TesseractOCR;
 
 class DocumentController extends Controller
 {
-    private DocumentServiceInterface $documents;
+    private DocumentAccessService $documentAccess;
+    private DocumentMutationService $documentMutations;
+    private DocumentWorkflowService $documentWorkflow;
+    private DocumentClassificationService $classifier;
+    private DocumentEmbeddingService $embeddings;
+    private DocumentContentStoreInterface $contentStore;
+    private OcrTextNormalizer $ocrTextNormalizer;
 
-    public function __construct(DocumentServiceInterface $documents)
-    {
-        $this->documents = $documents;
+    public function __construct(
+        DocumentAccessService $documentAccess,
+        DocumentMutationService $documentMutations,
+        DocumentWorkflowService $documentWorkflow,
+        DocumentClassificationService $classifier,
+        DocumentEmbeddingService $embeddings,
+        DocumentContentStoreInterface $contentStore,
+        OcrTextNormalizer $ocrTextNormalizer
+    ) {
+        $this->documentAccess = $documentAccess;
+        $this->documentMutations = $documentMutations;
+        $this->documentWorkflow = $documentWorkflow;
+        $this->classifier = $classifier;
+        $this->embeddings = $embeddings;
+        $this->contentStore = $contentStore;
+        $this->ocrTextNormalizer = $ocrTextNormalizer;
     }
 
-    /**
-     * إضافة وثيقة جديدة
-     * - منع رفع نفس الملف مرتين (نفس المحتوى)
-     * - Employees: في قسمهم فقط
-     * - Managers: في قسمهم فقط
-     * - Admins: في منظمتهم (أي قسم)
-     * - SuperAdmin: في أي مكان
-     */
     public function add(StoreDocumentRequest $request)
     {
         $user = Auth::user();
-        
         $validated = $request->validated();
-
         $file = $request->file('file');
-        
-        // حساب hash الملف
-        $fileHash = hash_file('sha256', $file->getRealPath());
-        
-        // التحقق من عدم وجود نفس الملف من نفس المستخدم
-        $existingDocument = Document::where('uploaded_by', $user->id)
-            ->whereRaw("SHA2(CONCAT(path, title), 256) = ?", [$fileHash])
-            ->first();
-            
-        // بطريقة أبسط: نتحقق من وجود ملف بنفس الحجم والـ mime type من نفس المستخدم
-        $existingDocument = Document::where('uploaded_by', $user->id)
-            ->where('size', $file->getSize())
-            ->where('mime_type', $file->getClientMimeType())
-            ->where('original_name', $file->getClientOriginalName())
-            ->first();
-            
+        $orgId = $request->input('organization_id', $user->organization_id);
+        $deptId = $request->input('department_id', $user->department_id);
+
+        if (!$this->documentAccess->canCreate($user, $orgId, $deptId)) {
+            return response()->json(['message' => $this->createDeniedMessage($user)], 403);
+        }
+
+        $existingDocument = $this->documentMutations->findDuplicateForUpload($user, $file);
+
         if ($existingDocument) {
             return response()->json([
                 'message' => 'هذا الملف موجود لديك بالفعل!',
@@ -60,97 +68,47 @@ class DocumentController extends Controller
             ], 422);
         }
 
+        if (
+            (in_array($user->role, ['Employee', 'Manager'], true) && (int) $deptId !== (int) $user->department_id)
+            || ($user->role === 'Admin' && (int) $orgId !== (int) $user->organization_id)
+            || $user->role === 'Auditor'
+        ) {
+            return response()->json(['message' => $this->createDeniedMessage($user)], 403);
+        }
+
         $path = $file->store('documents', 'public');
 
-        // تحديد organization_id و department_id
-        $org_id = $validated['organization_id'] ?? $user->organization_id;
-        $dept_id = $validated['department_id'] ?? $user->department_id;
+        $orgId = $validated['organization_id'] ?? $user->organization_id;
+        $deptId = $validated['department_id'] ?? $user->department_id;
 
-        // Validation: Employee و Manager يضيفان فقط في قسمهم
-        if (in_array($user->role, ['Employee', 'Manager'])) {
-            if ($dept_id !== $user->department_id) {
-                return response()->json(['message' => 'لا يمكنك إضافة وثيقة خارج قسمك'], 403);
-            }
+        if (in_array($user->role, ['Employee', 'Manager'], true) && $deptId !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك إضافة وثيقة خارج قسمك'], 403);
         }
 
-        // Validation: Admin يضيف فقط ضمن منظمته
-        if ($user->role === 'Admin') {
-            if ($org_id !== $user->organization_id) {
-                return response()->json(['message' => 'لا يمكنك إضافة وثيقة خارج منظمتك'], 403);
-            }
+        if ($user->role === 'Admin' && $orgId !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك إضافة وثيقة خارج منظمتك'], 403);
         }
 
-        // Auditor لا يمكنه إضافة
         if ($user->role === 'Auditor') {
             return response()->json(['message' => 'ليس لديك صلاحية لإضافة وثائق'], 403);
         }
 
-        $dto = new DocumentDto(
-            $validated['title'],
-            $validated['description'] ?? null,
-            $file->getClientOriginalName(),
-            $file->getClientMimeType(),
-            $file->getSize(),
-            $path,
-            Auth::id(),
-            $org_id,
-            $dept_id,
-        );
+        $document = $this->documentMutations->persistUploadedDocument($user, $validated, $file, $path);
 
-        return response()->json(
-            $this->documents->add($dto),
-            201
-        );
+        return response()->json($document, 201);
     }
 
-    /**
-     * عرض الوثائق حسب الدور والقسم
-     */
     public function index(Request $request)
     {
         $user = Auth::user();
 
-        if ($user->role === 'SuperAdmin') {
-            // عرض كل الوثائق
-            return response()->json(Document::with('user', 'organization', 'department')->get());
-        }
-
-        if ($user->role === 'Admin') {
-            // عرض كل الوثائق في منظمته
-            return response()->json(
-                Document::where('organization_id', $user->organization_id)
-                    ->with('user', 'organization', 'department')
-                    ->get()
-            );
-        }
-
-        if ($user->role === 'Manager') {
-            // عرض الوثائق في قسمه فقط
-            return response()->json(
-                Document::where('department_id', $user->department_id)
-                    ->with('user', 'organization', 'department')
-                    ->get()
-            );
-        }
-
-        if ($user->role === 'Employee' || $user->role === 'Auditor') {
-            // عرض الوثائق في قسمهم فقط
-            return response()->json(
-               Document::where('department_id', $user->department_id)
-                    ->with('user', 'organization', 'department')
-                    ->get()
-            );
-        }
-
-        return response()->json([]);
+        return response()->json($this->documentAccess->scopedQuery($user)->get());
     }
 
-    /**
-     * عرض الوثائق الخاصة به
-     */
     public function myDocuments(Request $request)
     {
         $userId = Auth::id();
+
         return response()->json(
             Document::where('uploaded_by', $userId)
                 ->with('user', 'organization', 'department')
@@ -158,9 +116,6 @@ class DocumentController extends Controller
         );
     }
 
-    /**
-     * عرض وثيقة واحدة
-     */
     public function show($id)
     {
         $user = Auth::user();
@@ -170,151 +125,105 @@ class DocumentController extends Controller
             return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
         }
 
-        // التحقق من الوصول
-        if ($user->role === 'SuperAdmin') {
-            return response()->json($doc);
-        }
-
-        if ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+        if (!$this->documentAccess->canAccess($user, $doc)) {
             return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
         }
 
-        if (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
-            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
-        }
+        $ocrText = $this->contentStore->getOcrText($doc);
 
-        return response()->json($doc);
+        return response()->json(array_merge(
+            $doc->toArray(),
+            ['extracted_text' => $ocrText],
+            $this->ocrDisplayPayload($ocrText)
+        ));
     }
 
-    /**
-     * تعديل وثيقة
-     * - Employee: تعديل وثائقه فقط ضمن قسمه
-     * - Manager: تعديل الوثائق ضمن قسمه
-     * - Admin: تعديل الوثائق ضمن منظمته
-     * - SuperAdmin: تعديل أي وثيقة
-     * - Auditor: لا يمكنه التعديل
-     */
     public function update(Request $request, $id)
     {
         $user = Auth::user();
         $doc = Document::find($id);
 
+        if ($doc && !$this->documentAccess->canUpdate($user, $doc)) {
+            return response()->json(['message' => $this->updateDeniedMessage($user)], 403);
+        }
+
         if (!$doc) {
             return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
         }
 
-        // Auditor لا يمكنه التعديل
         if ($user->role === 'Auditor') {
             return response()->json(['message' => 'ليس لديك صلاحية لتعديل الوثائق'], 403);
         }
 
-        // Employee يعدل فقط وثائقه
         if ($user->role === 'Employee') {
             if ($doc->uploaded_by !== $user->id || $doc->department_id !== $user->department_id) {
                 return response()->json(['message' => 'لا يمكنك تعديل هذه الوثيقة'], 403);
             }
         }
 
-        // Manager يعدل الوثائق في قسمه
-        if ($user->role === 'Manager') {
-            if ($doc->department_id !== $user->department_id) {
-                return response()->json(['message' => 'لا يمكنك تعديل وثائق خارج قسمك'], 403);
-            }
+        if ($user->role === 'Manager' && $doc->department_id !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك تعديل وثائق خارج قسمك'], 403);
         }
 
-        // Admin يعدل الوثائق في منظمته
-        if ($user->role === 'Admin') {
-            if ($doc->organization_id !== $user->organization_id) {
-                return response()->json(['message' => 'لا يمكنك تعديل وثائق خارج منظمتك'], 403);
-            }
+        if ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك تعديل وثائق خارج منظمتك'], 403);
+        }
+
+        if (!in_array($doc->status, [Document::STATUS_PENDING, Document::STATUS_REJECTED], true)) {
+            return response()->json([
+                'message' => 'Only pending or rejected documents can be updated.',
+                'current_status' => $doc->status,
+            ], 422);
         }
 
         $request->validate([
-            'file'        => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:10240',
-            'title'       => 'nullable|string|max:255',
+            'file' => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:10240',
+            'title' => 'nullable|string|max:255',
             'description' => 'nullable|string',
         ]);
 
-        $updateData = [];
+        $document = $this->documentMutations->updateDocument(
+            $doc,
+            array_merge($_POST ?? [], $request->all()),
+            $request->file('file')
+        );
 
-        // قراءة البيانات من $_POST و $request->all() معاً للتأكد
-        $allData = array_merge($_POST ?? [], $request->all());
-
-        // تحديث العنوان
-        if (!empty($allData['title'] ?? null)) {
-            $updateData['title'] = trim($allData['title']);
-        }
-
-        // تحديث الوصف
-        if (!empty($allData['description'] ?? null)) {
-            $updateData['description'] = trim($allData['description']);
-        }
-
-        // معالجة الملف الجديد (إن وجد)
-        if ($request->hasFile('file')) {
-            $file = $request->file('file');
-            
-            // حذف الملف القديم
-            if ($doc->path && Storage::disk('public')->exists($doc->path)) {
-                Storage::disk('public')->delete($doc->path);
-            }
-
-            // حفظ الملف الجديد
-            $newPath = $file->store('documents', 'public');
-            $updateData['path'] = $newPath;
-            $updateData['original_name'] = $file->getClientOriginalName();
-            $updateData['mime_type'] = $file->getClientMimeType();
-            $updateData['size'] = $file->getSize();
-        }
-
-        // تطبيق التحديثات على النموذج مباشرة
-        if (!empty($updateData)) {
-            foreach ($updateData as $key => $value) {
-                $doc->$key = $value;
-            }
-            $doc->save();
-        }
-
-        return response()->json($doc);
+        return response()->json($document);
     }
 
-    /**
-     * حذف وثيقة
-     * - Employee: لا يمكنه الحذف
-     * - Manager: حذف الوثائق في قسمه
-     * - Admin: حذف الوثائق في منظمته
-     * - SuperAdmin: حذف أي وثيقة
-     * - Auditor: لا يمكنه الحذف
-     */
     public function delete($id)
     {
         $user = Auth::user();
         $doc = Document::find($id);
 
+        if ($doc && !$this->documentAccess->canDelete($user, $doc)) {
+            return response()->json(['message' => $this->deleteDeniedMessage($user)], 403);
+        }
+
         if (!$doc) {
             return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
         }
 
-        // Employee و Auditor لا يمكنهم الحذف
-        if (in_array($user->role, ['Employee', 'Auditor'])) {
+        if (in_array($user->role, ['Employee', 'Auditor'], true)) {
             return response()->json(['message' => 'ليس لديك صلاحية لحذف الوثائق'], 403);
         }
 
-        // Manager يحذف الوثائق في قسمه
-        if ($user->role === 'Manager') {
-            if ($doc->department_id !== $user->department_id) {
-                return response()->json(['message' => 'لا يمكنك حذف وثائق خارج قسمك'], 403);
-            }
+        if ($user->role === 'Manager' && $doc->department_id !== $user->department_id) {
+            return response()->json(['message' => 'لا يمكنك حذف وثائق خارج قسمك'], 403);
         }
 
-        // Admin يحذف الوثائق في منظمته
-        if ($user->role === 'Admin') {
-            if ($doc->organization_id !== $user->organization_id) {
-                return response()->json(['message' => 'لا يمكنك حذف وثائق خارج منظمتك'], 403);
-            }
+        if ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
+            return response()->json(['message' => 'لا يمكنك حذف وثائق خارج منظمتك'], 403);
         }
 
-        $deleted = $this->documents->delete($id);
+        if (!in_array($doc->status, [Document::STATUS_PENDING, Document::STATUS_REJECTED], true)) {
+            return response()->json([
+                'message' => 'Only pending or rejected documents can be deleted.',
+                'current_status' => $doc->status,
+            ], 422);
+        }
+
+        $deleted = $this->documentMutations->deleteDocument($id);
         if (!$deleted) {
             return response()->json(['message' => 'فشل الحذف'], 500);
         }
@@ -322,10 +231,6 @@ class DocumentController extends Controller
         return response()->json(['message' => 'تم حذف الوثيقة بنجاح']);
     }
 
-    /**
-     * تحميل وثيقة
-     * - نفس قواعد الوصول مثل show()
-     */
     public function download($id)
     {
         $user = Auth::user();
@@ -335,30 +240,19 @@ class DocumentController extends Controller
             return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
         }
 
-        // التحقق من الوصول
-        if ($user->role === 'SuperAdmin') {
-            // يمكنه تحميل أي وثيقة
-        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
-            return response()->json(['message' => 'لا يمكنك تحميل هذه الوثيقة'], 403);
-        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+        if (!$this->documentAccess->canAccess($user, $doc)) {
             return response()->json(['message' => 'لا يمكنك تحميل هذه الوثيقة'], 403);
         }
 
-        // التحقق من وجود الملف
-        if (!$doc->path || !Storage::disk('public')->exists($doc->path)) {
+        /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
+        $disk = Storage::disk('public');
+        if (!$doc->path || !$disk->exists($doc->path)) {
             return response()->json(['message' => 'الملف غير موجود على الخادم'], 404);
         }
 
-        // إرجاع الملف للتحميل
-        /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
-        $disk = Storage::disk('public');
         return response()->download($disk->path($doc->path), $doc->original_name);
     }
 
-    /**
-     * عرض وثيقة (إرجاع رابط للعرض)
-     * - نفس قواعد الوصول مثل show()
-     */
     public function view($id)
     {
         $user = Auth::user();
@@ -368,75 +262,53 @@ class DocumentController extends Controller
             return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
         }
 
-        // التحقق من الوصول
-        if ($user->role === 'SuperAdmin') {
-            // يمكنه عرض أي وثيقة
-        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
-            return response()->json(['message' => 'لا يمكنك عرض هذه الوثيقة'], 403);
-        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+        if (!$this->documentAccess->canAccess($user, $doc)) {
             return response()->json(['message' => 'لا يمكنك عرض هذه الوثيقة'], 403);
         }
 
-        // التحقق من وجود الملف
         /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
         $disk = Storage::disk('public');
         if (!$doc->path || !$disk->exists($doc->path)) {
             return response()->json(['message' => 'الملف غير موجود على الخادم'], 404);
         }
 
-        // إرجاع رابط للعرض
         $url = $disk->url($doc->path);
+        $ocrText = $this->contentStore->getOcrText($doc);
 
         return response()->json([
             'document' => $doc,
-            'view_url' => $url
+            'view_url' => $url,
+            'extracted_text' => $ocrText,
+            ...$this->ocrDisplayPayload($ocrText),
         ]);
     }
 
-    /**
-     * البحث في الوثائق
-     * - البحث في العنوان والوصف
-     * - فلترة حسب الدور
-     */
     public function search(Request $request)
     {
         $user = Auth::user();
-        $query = $request->get('q', '');
-        $limit = $request->get('limit', 20);
+        $query = trim((string) $request->get('q', ''));
+        $typeFilter = trim((string) $request->get('document_type', ''));
+        $limit = max(1, min((int) $request->get('limit', 20), 100));
 
-        if (empty($query)) {
+        if ($query === '') {
             return response()->json(['message' => 'يجب تحديد كلمة البحث'], 400);
         }
 
-        $documentsQuery = Document::with('user', 'organization', 'department')
-            ->where(function ($q) use ($query) {
-                $q->where('title', 'like', "%{$query}%")
-                  ->orWhere('description', 'like', "%{$query}%")
-                  ->orWhere('original_name', 'like', "%{$query}%");
-            });
-
-        // تطبيق الفلاتر حسب الدور
-        if ($user->role === 'SuperAdmin') {
-            // لا قيود
-        } elseif ($user->role === 'Admin') {
-            $documentsQuery->where('organization_id', $user->organization_id);
-        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor'])) {
-            $documentsQuery->where('department_id', $user->department_id);
-        }
-
-        $documents = $documentsQuery->limit($limit)->get();
+        $search = $this->embeddings->search(
+            $this->documentAccess->scopedQuery($user),
+            $query,
+            $limit,
+            $typeFilter
+        );
 
         return response()->json([
             'query' => $query,
-            'results' => $documents,
-            'count' => $documents->count()
+            'search_mode' => $search['mode'],
+            'results' => $search['results'],
+            'count' => count($search['results']),
         ]);
     }
 
-    /**
-     * استخراج النص من الوثيقة باستخدام OCR
-     * - يدعم PDF و الصور
-     */
     public function extractOcr($id)
     {
         $user = Auth::user();
@@ -446,16 +318,10 @@ class DocumentController extends Controller
             return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
         }
 
-        // التحقق من الوصول
-        if ($user->role === 'SuperAdmin') {
-            // يمكنه استخراج OCR من أي وثيقة
-        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
-            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
-        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
+        if (!$this->documentAccess->canAccess($user, $doc)) {
             return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
         }
 
-        // التحقق من وجود الملف
         /** @var \Illuminate\Filesystem\FilesystemAdapter $disk */
         $disk = Storage::disk('public');
         if (!$doc->path || !$disk->exists($doc->path)) {
@@ -463,153 +329,676 @@ class DocumentController extends Controller
         }
 
         try {
-            // جرب Tesseract من PATH ثم من مسار ثابت
-            $tesseractExecutable = env('TESSERACT_PATH', 'C:\\Program Files\\Tesseract-OCR\\tesseract.exe');
-            $tesseractVersion = null;
-
-            if (file_exists($tesseractExecutable)) {
-                $tesseractVersion = shell_exec('"' . $tesseractExecutable . '" --version 2>&1');
-            } else {
-                $tesseractVersion = shell_exec('tesseract --version 2>&1');
-                if ($tesseractVersion) {
-                    $tesseractExecutable = 'tesseract';
-                }
-            }
-
-            if (!$tesseractVersion || stripos($tesseractVersion, 'tesseract') === false) {
+            $tesseractExecutable = $this->resolveTesseractExecutable();
+            if ($tesseractExecutable === null) {
+                $pdftoppmExecutable = $this->resolvePdftoppmExecutable();
                 return response()->json([
                     'message' => 'Tesseract OCR غير مثبت أو غير متاح في بيئة PHP',
-                    'error' => 'يجب تثبيت Tesseract OCR و/أو تحديث PATH',
-                    'install_instructions' => [
-                        '1. اذهب إلى: https://github.com/UB-Mannheim/tesseract/wiki',
-                        '2. ثبت Tesseract ثم أضف C:\\Program Files\\Tesseract-OCR إلى PATH',
-                        '3. تأكد أن الأمر tesseract يعمل في cmd/powershell',
-                        '4. أعد تشغيل الخادم وبيئة التطوير',
-                        '5. يمكن استعمال المتغير TESSERACT_PATH في .env لتحديد المسار مباشرة'
+                    'error' => 'يجب تثبيت Tesseract OCR وتحديث PATH أو TESSERACT_PATH',
+                    'diagnostics' => [
+                        'tesseract' => false,
+                        'imagick' => class_exists('Imagick'),
+                        'pdftoppm' => $pdftoppmExecutable !== null,
+                        'magick' => $this->commandExists('magick'),
                     ],
-                    'download_link' => 'https://github.com/UB-Mannheim/tesseract/wiki',
-                    'technical_error' => trim($tesseractVersion ?? 'غير معروف')
                 ], 503);
             }
 
             $filePath = $disk->path($doc->path);
-            $tempImage = null;
-
             $fileExtension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+            $converter = null;
 
             if ($fileExtension === 'pdf') {
+                [$images, $tempDir, $converter] = $this->convertPdfToImages($filePath);
 
-                try {
-                    $parser = new Parser();
-                    $pdf = $parser->parseFile($filePath);
+                if (empty($images)) {
+                    $this->cleanupTempDirectory($tempDir);
+                    $pdftoppmExecutable = $this->resolvePdftoppmExecutable();
 
-                    $extractedText = trim($pdf->getText());
-
-                    if (empty($extractedText)) {
-                        return response()->json([
-                            'message' => 'هذا PDF عبارة عن صورة (Scan)',
-                            'note' => 'يجب استخدام OCR له (سأعلمك لاحقًا)'
-                        ], 422);
-                    }
-
-                } catch (\Exception $e) {
                     return response()->json([
-                        'message' => 'فشل في قراءة PDF',
-                        'error' => $e->getMessage()
-                    ], 500);
+                        'message' => 'فشل تحويل PDF إلى صور لاستخراج OCR',
+                        'error' => 'ثبت Imagick+Ghostscript أو Poppler (pdftoppm) أو ImageMagick (magick).',
+                        'diagnostics' => [
+                            'tesseract' => true,
+                            'imagick' => class_exists('Imagick'),
+                            'pdftoppm' => $pdftoppmExecutable !== null,
+                            'magick' => $this->commandExists('magick'),
+                        ],
+                    ], 503);
                 }
 
-            } else {
-
-                // الصور فقط → OCR
-                $ocr = new TesseractOCR($filePath);
-                $ocr->executable($tesseractExecutable);
-                $ocr->lang('ara+eng');
-
-                $extractedText = $ocr->run();
-            }
-
-            $fileExtension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-
-            if ($fileExtension === 'pdf') {
-
                 try {
-                    $parser = new Parser();
-                    $pdf = $parser->parseFile($filePath);
-
-                    $extractedText = trim($pdf->getText());
-
-                    if (empty($extractedText)) {
-                        return response()->json([
-                            'message' => 'هذا PDF عبارة عن صورة (Scan)',
-                            'note' => 'حاليًا النظام يدعم فقط PDF النصي'
-                        ], 422);
-                    }
-
-                } catch (\Exception $e) {
-                    return response()->json([
-                        'message' => 'فشل في قراءة PDF',
-                        'error' => $e->getMessage()
-                    ], 500);
+                    $extractedText = $this->runOcrOnImages($images, $tesseractExecutable);
+                } finally {
+                    $this->cleanupTempDirectory($tempDir);
                 }
-
             } else {
-
-                // الصور فقط → OCR
-                $ocr = new TesseractOCR($filePath);
-                $ocr->executable($tesseractExecutable);
-                $ocr->lang('ara+eng');
-
-                $extractedText = $ocr->run();
+                $extractedText = $this->runOcrOnImage($filePath, $tesseractExecutable);
             }
 
-            // حذف الملف المؤقت إذا أنشأناه
-            if ($tempImage && file_exists($tempImage)) {
-                @unlink($tempImage);
+            $extractedText = $this->ocrTextNormalizer->normalize((string) $extractedText);
+            if ($extractedText === '') {
+                return response()->json([
+                    'message' => 'OCR لم يتمكن من استخراج نص مفيد من الوثيقة',
+                ], 422);
             }
 
-            // حفظ النص المستخرج في قاعدة البيانات
-            $doc->extracted_text = $extractedText;
+            $this->contentStore->saveOcrText($doc, $extractedText, [
+                'engine' => 'tesseract',
+                'pdf_converter' => $converter,
+            ]);
+
+            $classification = $this->classifier->classify(
+                title: (string) $doc->title,
+                description: $doc->description,
+                originalName: (string) $doc->original_name,
+                mimeType: $doc->mime_type,
+                extractedText: $extractedText,
+            );
+
+            $doc->document_type = $classification['document_type'];
+            $doc->classification_confidence = $classification['classification_confidence'];
+            $doc->classification_source = $classification['classification_source'];
             $doc->save();
+            $this->embeddings->syncDocumentQuietly($doc);
 
             return response()->json([
                 'document_id' => $doc->id,
                 'extracted_text' => $extractedText,
-                'message' => 'تم استخراج النص بنجاح'
+                ...$this->ocrDisplayPayload($extractedText),
+                'content_store' => $this->contentStore->driver(),
+                'pdf_converter' => $converter,
+                'message' => 'تم استخراج النص بنجاح',
             ]);
-
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return response()->json([
                 'message' => 'فشل في استخراج النص',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
 
-    /**
-     * عرض النص المستخرج من الوثيقة
-     */
     public function getOcrText($id)
     {
         $user = Auth::user();
         $doc = Document::with('user', 'organization', 'department')->find($id);
 
         if (!$doc) {
-            return response()->json(['message' => 'الوثيقة غير موجودة'], 404);
+            return response()->json(['message' => 'Document not found'], 404);
         }
 
-        // التحقق من الوصول
-        if ($user->role === 'SuperAdmin') {
-            // يمكنه عرض أي وثيقة
-        } elseif ($user->role === 'Admin' && $doc->organization_id !== $user->organization_id) {
-            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
-        } elseif (in_array($user->role, ['Manager', 'Employee', 'Auditor']) && $doc->department_id !== $user->department_id) {
-            return response()->json(['message' => 'لا يمكنك الوصول لهذه الوثيقة'], 403);
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        $storedText = $this->contentStore->getOcrText($doc);
+        $normalizedText = $this->ocrTextNormalizer->normalize($storedText);
+        if ($normalizedText !== '' && $normalizedText !== (string) $storedText) {
+            $this->contentStore->saveOcrText($doc, $normalizedText, [
+                'normalized_by' => 'OcrTextNormalizer',
+            ]);
+            $this->embeddings->syncDocumentQuietly($doc);
         }
 
         return response()->json([
             'document' => $doc,
-            'extracted_text' => $doc->extracted_text ?? 'لم يتم استخراج نص بعد'
+            'extracted_text' => $normalizedText !== '' ? $normalizedText : 'No OCR text extracted yet',
+            'content_store' => $this->contentStore->driver(),
+            ...$this->ocrDisplayPayload($normalizedText),
         ]);
     }
+
+    public function submitForReview(Request $request, $id)
+    {
+        $request->validate([
+            'notes' => 'nullable|string|max:2000',
+        ]);
+
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'Document not found'], 404);
+        }
+
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        if (!$this->documentAccess->canSubmitForReview($user, $doc)) {
+            return response()->json(['message' => 'You are not allowed to submit this document for review'], 403);
+        }
+
+        try {
+            $document = $this->documentWorkflow->submit(
+                $doc,
+                $user,
+                $request->input('notes'),
+            );
+        } catch (DocumentWorkflowTransitionException $exception) {
+            return $this->transitionNotAllowedResponse(
+                $doc,
+                $exception->allowedStatuses,
+                $exception->action
+            );
+        }
+
+        return response()->json([
+            'message' => 'Document submitted for review',
+            'document' => $document,
+        ]);
+    }
+
+    public function approve(Request $request, $id)
+    {
+        $request->validate([
+            'approval_notes' => 'nullable|string|max:2000',
+        ]);
+
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'Document not found'], 404);
+        }
+
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        if (!$this->documentAccess->canReviewWorkflow($user, $doc)) {
+            return response()->json(['message' => 'You are not allowed to approve this document'], 403);
+        }
+
+        try {
+            $document = $this->documentWorkflow->approve(
+                $doc,
+                $user,
+                $request->input('approval_notes'),
+            );
+        } catch (DocumentWorkflowTransitionException $exception) {
+            return $this->transitionNotAllowedResponse(
+                $doc,
+                $exception->allowedStatuses,
+                $exception->action
+            );
+        }
+
+        return response()->json([
+            'message' => 'Document approved',
+            'document' => $document,
+        ]);
+    }
+
+    public function reject(Request $request, $id)
+    {
+        $request->validate([
+            'rejection_reason' => 'required|string|max:2000',
+        ]);
+
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'Document not found'], 404);
+        }
+
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        if (!$this->documentAccess->canReviewWorkflow($user, $doc)) {
+            return response()->json(['message' => 'You are not allowed to reject this document'], 403);
+        }
+
+        try {
+            $document = $this->documentWorkflow->reject(
+                $doc,
+                $user,
+                trim((string) $request->input('rejection_reason')),
+            );
+        } catch (DocumentWorkflowTransitionException $exception) {
+            return $this->transitionNotAllowedResponse(
+                $doc,
+                $exception->allowedStatuses,
+                $exception->action
+            );
+        }
+
+        return response()->json([
+            'message' => 'Document rejected',
+            'document' => $document,
+        ]);
+    }
+
+    public function archive(Request $request, $id)
+    {
+        $request->validate([
+            'archive_reason' => 'nullable|string|max:2000',
+        ]);
+
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'Document not found'], 404);
+        }
+
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        if (!$this->documentAccess->canReviewWorkflow($user, $doc)) {
+            return response()->json(['message' => 'You are not allowed to archive this document'], 403);
+        }
+
+        try {
+            $document = $this->documentWorkflow->archive(
+                $doc,
+                $user,
+                $request->input('archive_reason'),
+            );
+        } catch (DocumentWorkflowTransitionException $exception) {
+            return $this->transitionNotAllowedResponse(
+                $doc,
+                $exception->allowedStatuses,
+                $exception->action
+            );
+        }
+
+        return response()->json([
+            'message' => 'Document archived',
+            'document' => $document,
+        ]);
+    }
+
+    public function reopen(Request $request, $id)
+    {
+        $request->validate([
+            'notes' => 'nullable|string|max:2000',
+        ]);
+
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'Document not found'], 404);
+        }
+
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        if (!$this->documentAccess->canReviewWorkflow($user, $doc)) {
+            return response()->json(['message' => 'You are not allowed to reopen this document'], 403);
+        }
+
+        try {
+            $document = $this->documentWorkflow->reopen(
+                $doc,
+                $user,
+                $request->input('notes'),
+            );
+        } catch (DocumentWorkflowTransitionException $exception) {
+            return $this->transitionNotAllowedResponse(
+                $doc,
+                $exception->allowedStatuses,
+                $exception->action
+            );
+        }
+
+        return response()->json([
+            'message' => 'Document moved back to review',
+            'document' => $document,
+        ]);
+    }
+
+    public function workflowHistory($id)
+    {
+        $user = Auth::user();
+        $doc = Document::find($id);
+
+        if (!$doc) {
+            return response()->json(['message' => 'Document not found'], 404);
+        }
+
+        if (!$this->documentAccess->canAccess($user, $doc)) {
+            return response()->json(['message' => 'You cannot access this document'], 403);
+        }
+
+        $history = DocumentApprovalLog::where('document_id', $doc->id)
+            ->with('actor:id,name,email,role')
+            ->orderBy('id')
+            ->get();
+
+        return response()->json([
+            'document' => $doc->fresh($this->documentWorkflow->relations()),
+            'history' => $history,
+        ]);
+    }
+
+    private function transitionNotAllowedResponse(Document $doc, array $allowed, string $action)
+    {
+        return response()->json([
+            'message' => "Invalid status transition for {$action}",
+            'current_status' => $doc->status,
+            'allowed_statuses' => $allowed,
+        ], 422);
+    }
+
+    private function createDeniedMessage($user): string
+    {
+        return match ($user->role) {
+            'Auditor' => 'ليس لديك صلاحية لإضافة وثائق',
+            'Admin' => 'لا يمكنك إضافة وثيقة خارج منظمتك',
+            'Employee', 'Manager' => 'لا يمكنك إضافة وثيقة خارج قسمك',
+            default => 'ليس لديك صلاحية لإضافة وثائق',
+        };
+    }
+
+    private function updateDeniedMessage($user): string
+    {
+        return match ($user->role) {
+            'Auditor' => 'ليس لديك صلاحية لتعديل الوثائق',
+            'Manager' => 'لا يمكنك تعديل وثائق خارج قسمك',
+            'Admin' => 'لا يمكنك تعديل وثائق خارج منظمتك',
+            default => 'لا يمكنك تعديل هذه الوثيقة',
+        };
+    }
+
+    private function deleteDeniedMessage($user): string
+    {
+        return match ($user->role) {
+            'Employee', 'Auditor' => 'ليس لديك صلاحية لحذف الوثائق',
+            'Manager' => 'لا يمكنك حذف وثائق خارج قسمك',
+            'Admin' => 'لا يمكنك حذف وثائق خارج منظمتك',
+            default => 'لا يمكنك حذف هذه الوثيقة',
+        };
+    }
+
+    private function resolveTesseractExecutable(): ?string
+    {
+        $fromEnv = env('TESSERACT_PATH');
+        if (!empty($fromEnv) && file_exists($fromEnv) && $this->isTesseractAvailable($fromEnv)) {
+            return $fromEnv;
+        }
+
+        if ($this->isTesseractAvailable('tesseract')) {
+            return 'tesseract';
+        }
+
+        $defaultWindowsPath = 'C:\\Program Files\\Tesseract-OCR\\tesseract.exe';
+        if (file_exists($defaultWindowsPath) && $this->isTesseractAvailable($defaultWindowsPath)) {
+            return $defaultWindowsPath;
+        }
+
+        return null;
+    }
+
+    private function isTesseractAvailable(string $binary): bool
+    {
+        $command = $binary === 'tesseract'
+            ? 'tesseract --version 2>&1'
+            : escapeshellarg($binary) . ' --version 2>&1';
+
+        $output = shell_exec($command);
+        return is_string($output) && stripos($output, 'tesseract') !== false;
+    }
+
+    private function convertPdfToImages(string $pdfPath): array
+    {
+        $tempDir = storage_path('app/tmp/ocr_' . str_replace('.', '', uniqid('', true)));
+        if (!is_dir($tempDir) && !mkdir($tempDir, 0777, true) && !is_dir($tempDir)) {
+            throw new \RuntimeException('Unable to create temporary OCR directory.');
+        }
+
+        if (class_exists('Imagick')) {
+            try {
+                $images = $this->convertPdfWithImagick($pdfPath, $tempDir);
+                if (!empty($images)) {
+                    return [$images, $tempDir, 'imagick'];
+                }
+            } catch (\Throwable $e) {
+                // Fallback to command-line converters
+            }
+        }
+
+        $pdftoppmExecutable = $this->resolvePdftoppmExecutable();
+        if ($pdftoppmExecutable !== null) {
+            $images = $this->convertPdfWithPdftoppm($pdfPath, $tempDir, $pdftoppmExecutable);
+            if (!empty($images)) {
+                return [$images, $tempDir, 'pdftoppm'];
+            }
+        }
+
+        if ($this->commandExists('magick')) {
+            $images = $this->convertPdfWithMagick($pdfPath, $tempDir);
+            if (!empty($images)) {
+                return [$images, $tempDir, 'magick'];
+            }
+        }
+
+        return [[], $tempDir, null];
+    }
+
+    private function convertPdfWithImagick(string $pdfPath, string $tempDir): array
+    {
+        $images = [];
+
+        $imagickClass = 'Imagick';
+        $imagick = new $imagickClass();
+        $imagick->setResolution(300, 300);
+        $imagick->readImage($pdfPath);
+
+        $index = 0;
+        foreach ($imagick as $page) {
+            $page->setImageFormat('png');
+            $page->setImageCompressionQuality(100);
+
+            $outputPath = $tempDir . DIRECTORY_SEPARATOR . sprintf('page-%03d.png', $index);
+            $page->writeImage($outputPath);
+            $images[] = $outputPath;
+            $index++;
+        }
+
+        $imagick->clear();
+        $imagick->destroy();
+
+        sort($images);
+        return $images;
+    }
+
+    private function convertPdfWithPdftoppm(string $pdfPath, string $tempDir, string $pdftoppmExecutable): array
+    {
+        $prefix = $tempDir . DIRECTORY_SEPARATOR . 'page';
+        $command = escapeshellarg($pdftoppmExecutable) . ' -png -r 300 ' . escapeshellarg($pdfPath) . ' ' . escapeshellarg($prefix) . ' 2>&1';
+        shell_exec($command);
+
+        $images = glob($tempDir . DIRECTORY_SEPARATOR . 'page-*.png') ?: [];
+        sort($images);
+
+        return $images;
+    }
+
+    private function convertPdfWithMagick(string $pdfPath, string $tempDir): array
+    {
+        $pattern = $tempDir . DIRECTORY_SEPARATOR . 'page-%03d.png';
+        $command = 'magick -density 300 ' . escapeshellarg($pdfPath) . ' -quality 100 ' . escapeshellarg($pattern) . ' 2>&1';
+        shell_exec($command);
+
+        $images = glob($tempDir . DIRECTORY_SEPARATOR . 'page-*.png') ?: [];
+        sort($images);
+
+        return $images;
+    }
+
+    private function runOcrOnImages(array $imagePaths, string $tesseractExecutable): string
+    {
+        $chunks = [];
+
+        foreach ($imagePaths as $imagePath) {
+            $text = trim($this->runOcrOnImage($imagePath, $tesseractExecutable));
+            if ($text !== '') {
+                $chunks[] = $text;
+            }
+        }
+
+        return implode(PHP_EOL . PHP_EOL, $chunks);
+    }
+
+    private function runOcrOnImage(string $imagePath, string $tesseractExecutable): string
+    {
+        $candidates = [];
+        foreach ([6, 4, 11] as $psm) {
+            $candidate = $this->runSingleOcrPass($imagePath, $tesseractExecutable, $psm);
+            if ($candidate !== '') {
+                $candidates[] = $candidate;
+            }
+        }
+
+        if ($candidates === []) {
+            return '';
+        }
+
+        usort($candidates, fn (string $left, string $right): int => $this->scoreOcrCandidate($right) <=> $this->scoreOcrCandidate($left));
+
+        return $candidates[0];
+    }
+
+    private function runSingleOcrPass(string $imagePath, string $tesseractExecutable, int $psm): string
+    {
+        $ocr = new TesseractOCR($imagePath);
+        $ocr->executable($tesseractExecutable);
+        $ocr->lang('ara+eng');
+        $ocr->oem(1);
+        $ocr->psm($psm);
+        $ocr->preserve_interword_spaces('1');
+        $ocr->user_defined_dpi('300');
+        $ocr->load_system_dawg('0');
+        $ocr->load_freq_dawg('0');
+        $ocr->textord_heavy_nr('1');
+
+        $tessdataDir = $this->resolveTessdataDirectory($tesseractExecutable);
+        if ($tessdataDir !== null) {
+            $ocr->tessdataDir($tessdataDir);
+        }
+
+        return $this->ocrTextNormalizer->normalize((string) $ocr->run());
+    }
+
+    private function scoreOcrCandidate(string $text): int
+    {
+        preg_match_all('/\p{Arabic}/u', $text, $arabicMatches);
+        preg_match_all('/[A-Za-z]/u', $text, $latinMatches);
+        preg_match_all('/\d/u', $text, $digitMatches);
+        preg_match_all('/[^\p{Arabic}A-Za-z0-9\s\.\,\:\;\-\(\)\/]/u', $text, $noiseMatches);
+
+        $arabicCount = count($arabicMatches[0]);
+        $latinCount = count($latinMatches[0]);
+        $digitCount = count($digitMatches[0]);
+        $noiseCount = count($noiseMatches[0]);
+
+        $lineCount = max(1, substr_count($text, "\n") + 1);
+        $lengthScore = min(mb_strlen($text), 2000);
+
+        return ($arabicCount * 5) + ($latinCount * 2) + $digitCount + $lengthScore + ($lineCount * 3) - ($noiseCount * 8);
+    }
+
+    private function resolveTessdataDirectory(string $tesseractExecutable): ?string
+    {
+        $fromEnv = env('TESSDATA_PREFIX');
+        if (!empty($fromEnv) && is_dir($fromEnv)) {
+            return $fromEnv;
+        }
+
+        if ($tesseractExecutable !== 'tesseract') {
+            $candidate = dirname($tesseractExecutable) . DIRECTORY_SEPARATOR . 'tessdata';
+            if (is_dir($candidate)) {
+                return $candidate;
+            }
+        }
+
+        $defaultWindowsPath = 'C:\\Program Files\\Tesseract-OCR\\tessdata';
+        if (is_dir($defaultWindowsPath)) {
+            return $defaultWindowsPath;
+        }
+
+        return null;
+    }
+
+    private function commandExists(string $command): bool
+    {
+        $checkCommand = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN'
+            ? 'where ' . $command . ' 2>NUL'
+            : 'command -v ' . $command . ' 2>/dev/null';
+
+        $output = shell_exec($checkCommand);
+        return !empty(trim((string) $output));
+    }
+
+    private function resolvePdftoppmExecutable(): ?string
+    {
+        $fromEnv = env('PDFTOPPM_PATH');
+        if (!empty($fromEnv) && file_exists($fromEnv)) {
+            return $fromEnv;
+        }
+
+        if ($this->commandExists('pdftoppm')) {
+            return 'pdftoppm';
+        }
+
+        $localAppData = (string) getenv('LOCALAPPDATA');
+        $packagesRoot = rtrim($localAppData, '\\/') . DIRECTORY_SEPARATOR . 'Microsoft' . DIRECTORY_SEPARATOR . 'WinGet' . DIRECTORY_SEPARATOR . 'Packages';
+
+        if (is_dir($packagesRoot)) {
+            $packageDirs = glob($packagesRoot . DIRECTORY_SEPARATOR . 'oschwartz10612.Poppler_*') ?: [];
+
+            foreach ($packageDirs as $packageDir) {
+                try {
+                    $iterator = new \RecursiveIteratorIterator(
+                        new \RecursiveDirectoryIterator($packageDir, \FilesystemIterator::SKIP_DOTS)
+                    );
+
+                    foreach ($iterator as $file) {
+                        /** @var \SplFileInfo $file */
+                        if ($file->isFile() && strtolower($file->getFilename()) === 'pdftoppm.exe') {
+                            return $file->getPathname();
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    // Ignore inaccessible package directories.
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function cleanupTempDirectory(string $tempDir): void
+    {
+        if (!is_dir($tempDir)) {
+            return;
+        }
+
+        $files = glob($tempDir . DIRECTORY_SEPARATOR . '*') ?: [];
+        foreach ($files as $file) {
+            if (is_file($file)) {
+                @unlink($file);
+            }
+        }
+
+        @rmdir($tempDir);
+    }
+
+    private function ocrDisplayPayload(?string $text): array
+    {
+        $normalized = $this->ocrTextNormalizer->normalize($text);
+
+        return [
+            'extracted_text_normalized' => $normalized === '' ? null : $normalized,
+            'extracted_text_display' => $normalized === '' ? null : $this->ocrTextNormalizer->formatForDisplay($normalized),
+            'extracted_text_direction' => $normalized === '' ? 'auto' : $this->ocrTextNormalizer->direction($normalized),
+        ];
+    }
 }
+

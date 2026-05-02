@@ -23,9 +23,6 @@ use App\Http\Controllers\DepartmentController;
 // المسارات العامة — لا تتطلب توثيق
 // -------------------------------------------------------------------------
 
-// Register / Add new user (Admin adds employees)
-Route::post('/AddUser', [AuthController::class, 'AddUser']);
-
 // Login with rate limit protection (throttled)
 // تسجيل الدخول مع حماية من تكرار المحاولات
 Route::post('/login', [AuthController::class, 'login'])
@@ -74,8 +71,14 @@ Route::middleware('auth:sanctum')->group(function () {
     // Admin & Manager Actions — عمليات المدير/المدير التنفيذي
     // ---------------------------------------------------------------------
 
-    // Admin + Manager : Update user data and toggle status
-    Route::middleware('role:Admin,Manager')->group(function () {
+    // SuperAdmin + Admin: create users (legacy /AddUser kept as alias)
+    Route::middleware('role:SuperAdmin,Admin')->group(function () {
+        Route::post('/users', [AuthController::class, 'addUser']);
+        Route::post('/AddUser', [AuthController::class, 'addUser']);
+    });
+
+    // SuperAdmin + Admin + Manager: Update user data and toggle status
+    Route::middleware('role:SuperAdmin,Admin,Manager')->group(function () {
         Route::post('/users/{id}', [AuthController::class, 'updateUser']);
         Route::post('/users/{id}/status', [AuthController::class, 'changeStatus']);
     });
@@ -85,7 +88,7 @@ Route::middleware('auth:sanctum')->group(function () {
     // Admin Only Actions — عمليات خاصة بالأدمن فقط
     // ---------------------------------------------------------------------
 
-    Route::middleware('role:Admin')->group(function () {
+    Route::middleware('role:SuperAdmin,Admin')->group(function () {
         Route::delete('/users/delete/{id}', [AuthController::class, 'deleteUser']);
     });
 
@@ -146,6 +149,20 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/documents/{id}/ocr', [DocumentController::class, 'getOcrText'])
         ->middleware('auth:sanctum');
 
+    // Workflow: submit/review/approve/reject/archive/reopen + history
+    Route::post('/documents/{id}/submit', [DocumentController::class, 'submitForReview'])
+        ->middleware('auth:sanctum');
+    Route::post('/documents/{id}/approve', [DocumentController::class, 'approve'])
+        ->middleware('auth:sanctum');
+    Route::post('/documents/{id}/reject', [DocumentController::class, 'reject'])
+        ->middleware('auth:sanctum');
+    Route::post('/documents/{id}/archive', [DocumentController::class, 'archive'])
+        ->middleware('auth:sanctum');
+    Route::post('/documents/{id}/reopen', [DocumentController::class, 'reopen'])
+        ->middleware('auth:sanctum');
+    Route::get('/documents/{id}/history', [DocumentController::class, 'workflowHistory'])
+        ->middleware('auth:sanctum');
+
 });
 
 Route::middleware(['auth:sanctum', 'role:SuperAdmin'])->group(function () {
@@ -159,7 +176,7 @@ Route::middleware(['auth:sanctum', 'role:SuperAdmin'])->group(function () {
 });
 
 // DEPARTMENTS: SuperAdmin (all) + Admin (his organization only)
-Route::middleware(['auth:sanctum'])->group(function () {
+Route::middleware(['auth:sanctum', 'role:SuperAdmin,Admin'])->group(function () {
     Route::get('/organizations/{orgId}/departments', [DepartmentController::class, 'index']);
     Route::post('/organizations/{orgId}/departments', [DepartmentController::class, 'store']);
     Route::get('/departments/{id}', [DepartmentController::class, 'show']);
@@ -167,6 +184,3 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::patch('/departments/{id}', [DepartmentController::class, 'update']);
     Route::delete('/departments/{id}', [DepartmentController::class, 'destroy']);
 });
-
-
-

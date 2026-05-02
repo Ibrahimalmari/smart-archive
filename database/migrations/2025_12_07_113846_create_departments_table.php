@@ -18,7 +18,7 @@ return new class extends Migration
               ->onDelete('cascade');  // لو انحذفت المؤسسة تنحذف الأقسام التابعة لها
         $table->string('name');         // اسم القسم (الموارد البشرية، المالية...)
         $table->string('code')->nullable(); // كود داخلي للقسم
-        $table->enum('status', ['Active', 'Inactive'])->default('Active');
+        $table->enum('status', ['active', 'inactive'])->default('active');
         $table->timestamps();
     });
 }

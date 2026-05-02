@@ -66,3 +66,16 @@ Authorization: Bearer {token}
 - Google Cloud Vision API
 - Azure Computer Vision
 - AWS Textract
+---
+
+## PDF Arabic OCR Requirements (Important)
+
+For reliable Arabic text extraction from PDF files, the backend now converts PDF pages to images first, then runs Tesseract OCR.
+
+One of these PDF converters must be available:
+
+1. `Imagick` PHP extension + Ghostscript (recommended).
+2. Poppler tool: `pdftoppm`.
+3. ImageMagick CLI: `magick` with PDF support.
+
+If none of the above is available, `/api/documents/{id}/ocr` for PDF will return `503` with guidance.

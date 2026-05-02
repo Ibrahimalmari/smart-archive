@@ -18,7 +18,7 @@ return new class extends Migration
         $table->string('country')->nullable();
         $table->string('city')->nullable();
         $table->string('address')->nullable();
-        $table->enum('status', ['Active', 'Inactive'])->default('Active');
+        $table->enum('status', ['active', 'inactive'])->default('active');
         $table->timestamps();
     });
 }
